@@ -15,7 +15,7 @@ from fastapi import FastAPI, Header, HTTPException
 from google.oauth2.service_account import Credentials
 
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 STATE_HEADERS = ["key", "value", "updated_at"]
 LOTS_HEADERS = [
@@ -70,6 +70,8 @@ class Config:
     alpaca_secret_key: str
     alpaca_paper: bool
     trading_base_url: str
+    data_base_url: str
+    alpaca_data_feed: str
 
     google_sheet_id: str
     google_service_account_json: str
@@ -82,6 +84,12 @@ class Config:
     ignored_profit_symbols: Set[str]
     min_child_notional: Decimal
     dry_run: bool
+    rsi_enabled: bool
+    rsi_period: int
+    rsi_threshold: Decimal
+    rsi_bars_limit: int
+    rsi_timeframe: str
+    rsi_adjustment: str
 
     seed_positions_on_first_run: bool
     page_size: int
@@ -174,6 +182,8 @@ def load_config() -> Config:
         alpaca_secret_key=env_required("ALPACA_SECRET_KEY"),
         alpaca_paper=alpaca_paper,
         trading_base_url=os.getenv("ALPACA_TRADING_BASE_URL", default_base_url).strip() or default_base_url,
+        data_base_url=os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").strip() or "https://data.alpaca.markets",
+        alpaca_data_feed=os.getenv("ALPACA_DATA_FEED", "iex").strip().lower(),
         google_sheet_id=env_required("GOOGLE_SHEET_ID"),
         google_service_account_json=env_required("GOOGLE_SERVICE_ACCOUNT_JSON"),
         state_tab=os.getenv("PROFIT_STATE_TAB", "ProfitReinvestState").strip() or "ProfitReinvestState",
@@ -184,6 +194,12 @@ def load_config() -> Config:
         ignored_profit_symbols=ignored,
         min_child_notional=env_decimal("MIN_CHILD_NOTIONAL", "1.00"),
         dry_run=env_bool("DRY_RUN", True),
+        rsi_enabled=env_bool("RSI_ENABLED", True),
+        rsi_period=max(2, env_int("RSI_PERIOD", 14)),
+        rsi_threshold=env_decimal("RSI_THRESHOLD", "30"),
+        rsi_bars_limit=max(20, env_int("RSI_BARS_LIMIT", 100)),
+        rsi_timeframe=os.getenv("RSI_TIMEFRAME", "1Day").strip() or "1Day",
+        rsi_adjustment=os.getenv("RSI_ADJUSTMENT", "split").strip().lower() or "split",
         seed_positions_on_first_run=env_bool("SEED_POSITIONS_ON_FIRST_RUN", True),
         page_size=max(1, min(100, env_int("ACTIVITY_PAGE_SIZE", 100))),
         max_pages_per_cycle=max(1, env_int("MAX_ACTIVITY_PAGES_PER_CYCLE", 10)),
@@ -200,6 +216,10 @@ def load_config() -> Config:
 
     if cfg.min_child_notional <= 0:
         raise RuntimeError("MIN_CHILD_NOTIONAL must be greater than 0")
+    if cfg.rsi_threshold <= 0 or cfg.rsi_threshold >= 100:
+        raise RuntimeError("RSI_THRESHOLD must be greater than 0 and less than 100")
+    if cfg.rsi_bars_limit <= cfg.rsi_period:
+        raise RuntimeError("RSI_BARS_LIMIT must be greater than RSI_PERIOD")
     return cfg
 
 
@@ -322,12 +342,20 @@ def pending_key(symbol: str) -> str:
     return f"pending_{clean_symbol(symbol)}"
 
 
+def state_symbol_key(prefix: str, symbol: str) -> str:
+    return f"{prefix}_{clean_symbol(symbol)}"
+
+
 def get_pending(state: Dict[str, str], symbol: str) -> Decimal:
     return to_decimal(state.get(pending_key(symbol)), Decimal("0")) or Decimal("0")
 
 
 def set_pending(state: Dict[str, Any], symbol: str, value: Decimal) -> None:
     state[pending_key(symbol)] = decimal_text(max(value, Decimal("0")))
+
+
+def total_pending(state: Dict[str, str], symbols: Sequence[str]) -> Decimal:
+    return sum((get_pending(state, symbol) for symbol in symbols), Decimal("0"))
 
 
 def alpaca_headers(cfg: Config) -> Dict[str, str]:
@@ -354,6 +382,10 @@ def raise_for_status_with_body(resp: requests.Response, cfg: Config, method: str
 
 def http_get(session: requests.Session, cfg: Config, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     url = f"{cfg.trading_base_url}{path}"
+    return http_get_url(session, cfg, url, params)
+
+
+def http_get_url(session: requests.Session, cfg: Config, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
     last_exc: Optional[BaseException] = None
     for attempt in range(1, cfg.request_retries + 1):
         try:
@@ -412,6 +444,81 @@ def get_order_by_client_order_id(session: requests.Session, cfg: Config, client_
     return order if isinstance(order, dict) else None
 
 
+def extract_bar_close(bar: Dict[str, Any]) -> Optional[Decimal]:
+    value = bar.get("c", bar.get("close"))
+    close = to_decimal(value)
+    if close is None or close <= 0:
+        return None
+    return close
+
+
+def fetch_daily_closes(session: requests.Session, cfg: Config, symbol: str) -> List[Decimal]:
+    params: Dict[str, Any] = {
+        "timeframe": cfg.rsi_timeframe,
+        "limit": cfg.rsi_bars_limit,
+        "adjustment": cfg.rsi_adjustment,
+    }
+    if cfg.alpaca_data_feed:
+        params["feed"] = cfg.alpaca_data_feed
+
+    url = f"{cfg.data_base_url}/v2/stocks/{symbol}/bars"
+    payload = http_get_url(session, cfg, url, params)
+    bars = payload.get("bars") if isinstance(payload, dict) else None
+    if not isinstance(bars, list):
+        return []
+    closes = [close for close in (extract_bar_close(bar) for bar in bars if isinstance(bar, dict)) if close is not None]
+    return closes
+
+
+def calculate_rsi(closes: Sequence[Decimal], period: int) -> Optional[Decimal]:
+    if len(closes) <= period:
+        return None
+
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    seed = deltas[:period]
+    avg_gain = sum((max(delta, Decimal("0")) for delta in seed), Decimal("0")) / Decimal(period)
+    avg_loss = sum((abs(min(delta, Decimal("0"))) for delta in seed), Decimal("0")) / Decimal(period)
+
+    for delta in deltas[period:]:
+        gain = max(delta, Decimal("0"))
+        loss = abs(min(delta, Decimal("0")))
+        avg_gain = ((avg_gain * Decimal(period - 1)) + gain) / Decimal(period)
+        avg_loss = ((avg_loss * Decimal(period - 1)) + loss) / Decimal(period)
+
+    if avg_loss == 0:
+        return Decimal("100")
+    relative_strength = avg_gain / avg_loss
+    return Decimal("100") - (Decimal("100") / (Decimal("1") + relative_strength))
+
+
+def rsi_signal_for_symbol(session: requests.Session, cfg: Config, symbol: str) -> Dict[str, Any]:
+    if not cfg.rsi_enabled:
+        return {"symbol": symbol, "enabled": False, "ready": True, "rsi": None, "reason": "rsi_disabled"}
+
+    closes = fetch_daily_closes(session, cfg, symbol)
+    rsi = calculate_rsi(closes, cfg.rsi_period)
+    if rsi is None:
+        return {
+            "symbol": symbol,
+            "enabled": True,
+            "ready": False,
+            "rsi": None,
+            "bars": len(closes),
+            "reason": "not_enough_rsi_bars",
+        }
+
+    ready = rsi <= cfg.rsi_threshold
+    return {
+        "symbol": symbol,
+        "enabled": True,
+        "ready": ready,
+        "rsi": decimal_text(rsi, "0.01"),
+        "threshold": decimal_text(cfg.rsi_threshold, "0.01"),
+        "bars": len(closes),
+        "reason": "rsi_at_or_below_threshold" if ready else "rsi_above_threshold",
+    }
+
+
 def seed_lots_from_positions(
     session: requests.Session,
     cfg: Config,
@@ -466,6 +573,7 @@ def ensure_initialized(
     state.setdefault("total_realized_profit", "0.0000")
     state.setdefault("total_positive_profit", "0.0000")
     state.setdefault("total_reinvested", "0.0000")
+    state.setdefault("available_to_invest", "0.0000")
     state.setdefault("next_order_seq", "0")
     for symbol in cfg.invest_target_symbols:
         state.setdefault(pending_key(symbol), "0.0000")
@@ -727,18 +835,52 @@ def invest_pending(
         "orders_submitted": 0,
         "dry_run_orders": 0,
         "skipped_below_min": [],
+        "skipped_rsi": [],
         "skipped_buying_power": [],
         "errors": [],
+        "rsi": {},
     }
     buying_power: Optional[Decimal] = None
     total_reinvested = to_decimal(state.get("total_reinvested"), Decimal("0")) or Decimal("0")
     seq = int(to_decimal(state.get("next_order_seq"), Decimal("0")) or Decimal("0"))
+    rsi_cache: Dict[str, Dict[str, Any]] = {}
+    state_changed = False
 
     for symbol in cfg.invest_target_symbols:
         pending = get_pending(state, symbol)
         notional = cents_down(pending)
         if notional < cfg.min_child_notional:
             summary["skipped_below_min"].append({"symbol": symbol, "pending": decimal_text(pending)})
+            continue
+
+        if symbol not in rsi_cache:
+            try:
+                rsi_cache[symbol] = rsi_signal_for_symbol(session, cfg, symbol)
+            except Exception as exc:
+                logger.exception("Could not evaluate RSI for %s", symbol)
+                rsi_cache[symbol] = {
+                    "symbol": symbol,
+                    "enabled": cfg.rsi_enabled,
+                    "ready": False,
+                    "rsi": None,
+                    "reason": f"rsi_error: {exc}",
+                }
+        signal = rsi_cache[symbol]
+        summary["rsi"][symbol] = signal
+        state[state_symbol_key("last_rsi", symbol)] = signal.get("rsi") or ""
+        state[state_symbol_key("last_rsi_reason", symbol)] = signal.get("reason") or ""
+        state[state_symbol_key("last_rsi_checked_at", symbol)] = utc_now_iso()
+        state_changed = True
+        if not signal.get("ready"):
+            summary["skipped_rsi"].append(
+                {
+                    "symbol": symbol,
+                    "pending": decimal_text(pending),
+                    "notional": f"{notional:.2f}",
+                    "rsi": signal.get("rsi"),
+                    "reason": signal.get("reason"),
+                }
+            )
             continue
 
         if buying_power is None and not cfg.dry_run:
@@ -762,6 +904,7 @@ def invest_pending(
             state["next_order_seq"] = str(seq)
             total_reinvested += notional
             state["total_reinvested"] = decimal_text(total_reinvested)
+            state_changed = True
             replace_sheet_rows(worksheets["state"], STATE_HEADERS, state_rows(state))
             replace_sheet_rows(worksheets["orders"], ORDER_HEADERS, order_rows)
             summary["orders_submitted"] += 1
@@ -771,6 +914,11 @@ def invest_pending(
             logger.exception("Could not submit reinvestment order for %s", symbol)
             summary["errors"].append({"symbol": symbol, "error": str(exc)})
 
+    state["available_to_invest"] = decimal_text(total_pending(state, cfg.invest_target_symbols))
+    state_changed = True
+
+    if state_changed:
+        replace_sheet_rows(worksheets["state"], STATE_HEADERS, state_rows(state))
     return summary
 
 
@@ -806,6 +954,7 @@ def run_cycle(source: str = "manual") -> Dict[str, Any]:
             state["last_cycle_source"] = source
             for symbol in cfg.invest_target_symbols:
                 state.setdefault(pending_key(symbol), "0.0000")
+            state["available_to_invest"] = decimal_text(total_pending(state, cfg.invest_target_symbols))
 
             replace_sheet_rows(worksheets["lots"], LOTS_HEADERS, lots)
             replace_sheet_rows(worksheets["activity"], ACTIVITY_HEADERS, activity_rows)
@@ -821,6 +970,7 @@ def run_cycle(source: str = "manual") -> Dict[str, Any]:
                     "activity": activity_summary,
                     "investing": invest_summary,
                     "pending": {symbol: decimal_text(get_pending(state, symbol)) for symbol in cfg.invest_target_symbols},
+                    "available_to_invest": decimal_text(total_pending(state, cfg.invest_target_symbols)),
                     "total_positive_profit": state.get("total_positive_profit", "0.0000"),
                     "total_reinvested": state.get("total_reinvested", "0.0000"),
                 }
