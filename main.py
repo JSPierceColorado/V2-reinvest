@@ -924,9 +924,11 @@ def invest_pending(
 
 def run_cycle(source: str = "manual") -> Dict[str, Any]:
     if not RUN_LOCK.acquire(blocking=False):
+        logger.info("Profit reinvestor cycle skipped source=%s reason=already_running", source)
         return {"status": "busy", "source": source, "version": APP_VERSION}
 
     started = utc_now_iso()
+    logger.info("Profit reinvestor cycle started source=%s", source)
     summary: Dict[str, Any] = {
         "status": "ok",
         "version": APP_VERSION,
@@ -984,6 +986,28 @@ def run_cycle(source: str = "manual") -> Dict[str, Any]:
         LAST_STATUS.clear()
         LAST_STATUS.update(summary)
         RUN_LOCK.release()
+        if summary.get("status") == "ok":
+            activity = summary.get("activity", {})
+            investing = summary.get("investing", {})
+            logger.info(
+                "Profit reinvestor cycle finished source=%s fills_processed=%s available_to_invest=%s "
+                "orders_submitted=%s dry_run_orders=%s skipped_below_min=%s skipped_rsi=%s errors=%s",
+                source,
+                activity.get("fills_processed"),
+                summary.get("available_to_invest"),
+                investing.get("orders_submitted"),
+                investing.get("dry_run_orders"),
+                len(investing.get("skipped_below_min", [])),
+                len(investing.get("skipped_rsi", [])),
+                len(investing.get("errors", [])),
+            )
+        else:
+            logger.info(
+                "Profit reinvestor cycle finished source=%s status=%s error=%s",
+                source,
+                summary.get("status"),
+                summary.get("error"),
+            )
 
     return summary
 
@@ -992,6 +1016,7 @@ def worker_loop() -> None:
     while not STOP_EVENT.is_set():
         result = run_cycle("loop")
         sleep_seconds = load_sleep_seconds(result)
+        logger.info("Profit reinvestor sleeping seconds=%s last_status=%s", sleep_seconds, result.get("status"))
         STOP_EVENT.wait(sleep_seconds)
 
 
@@ -1027,8 +1052,10 @@ def startup_event() -> None:
         WORKER_THREAD = threading.Thread(target=worker_loop, name="profit-reinvestor-loop", daemon=True)
         WORKER_THREAD.start()
         LAST_STATUS.update({"state": "running", "version": APP_VERSION})
+        logger.info("Profit reinvestor background loop started poll_seconds=%s", cfg.poll_seconds)
     else:
         LAST_STATUS.update({"state": "idle", "version": APP_VERSION})
+        logger.info("Profit reinvestor background loop disabled BOT_AUTO_START=false")
 
 
 @app.on_event("shutdown")
