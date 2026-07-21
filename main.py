@@ -15,7 +15,7 @@ from fastapi import FastAPI, Header, HTTPException
 from google.oauth2.service_account import Credentials
 
 
-APP_VERSION = "0.3.0-health-aware-rsi-fix"
+APP_VERSION = "0.4.0-profit-split-50-50"
 
 STATE_HEADERS = ["key", "value", "updated_at"]
 LOTS_HEADERS = [
@@ -39,6 +39,9 @@ ACTIVITY_HEADERS = [
     "pending_added",
     "note",
     "processed_at",
+    "reinvest_fraction",
+    "retained_cash",
+    "contract_multiplier",
 ]
 ORDER_HEADERS = [
     "order_id",
@@ -92,21 +95,9 @@ class Config:
     rsi_adjustment: str
     rsi_lookback_days: int
 
-    # Reinvestment portfolio-health gate. RED pauses all reinvestment, YELLOW
-    # reduces order size, and GREEN invests the full pending amount.
-    health_gate_enabled: bool
-    health_max_position_count: int
-    health_yellow_exposure_pct: Decimal
-    health_red_exposure_pct: Decimal
-    health_yellow_min_cash_pct: Decimal
-    health_red_min_cash_pct: Decimal
-    health_yellow_drawdown_pct: Decimal
-    health_red_drawdown_pct: Decimal
-    health_yellow_red_position_pct: Decimal
-    health_red_red_position_pct: Decimal
-    health_require_positive_total_realized: bool
-    health_yellow_investment_multiplier: Decimal
-    health_equity_high_watermark: Decimal
+    # Fraction of each positive realized profit allocated to reinvestment.
+    # The remaining profit stays in account cash and never enters pending.
+    profit_reinvest_fraction: Decimal
 
     seed_positions_on_first_run: bool
     page_size: int
@@ -218,21 +209,7 @@ def load_config() -> Config:
         rsi_timeframe=os.getenv("RSI_TIMEFRAME", "1Day").strip() or "1Day",
         rsi_adjustment=os.getenv("RSI_ADJUSTMENT", "split").strip().lower() or "split",
         rsi_lookback_days=max(30, env_int("RSI_LOOKBACK_DAYS", 365)),
-        health_gate_enabled=env_bool("REINVEST_HEALTH_GATE_ENABLED", True),
-        health_max_position_count=max(1, env_int("REINVEST_MAX_POSITION_COUNT", 60)),
-        health_yellow_exposure_pct=env_decimal("REINVEST_YELLOW_EXPOSURE_PCT", "0.75"),
-        health_red_exposure_pct=env_decimal("REINVEST_RED_EXPOSURE_PCT", "0.85"),
-        health_yellow_min_cash_pct=env_decimal("REINVEST_YELLOW_MIN_CASH_PCT", "0.10"),
-        health_red_min_cash_pct=env_decimal("REINVEST_RED_MIN_CASH_PCT", "0.05"),
-        health_yellow_drawdown_pct=env_decimal("REINVEST_YELLOW_DRAWDOWN_PCT", "0.05"),
-        health_red_drawdown_pct=env_decimal("REINVEST_RED_DRAWDOWN_PCT", "0.10"),
-        health_yellow_red_position_pct=env_decimal("REINVEST_YELLOW_RED_POSITION_PCT", "0.55"),
-        health_red_red_position_pct=env_decimal("REINVEST_RED_RED_POSITION_PCT", "0.70"),
-        health_require_positive_total_realized=env_bool(
-            "REINVEST_REQUIRE_POSITIVE_TOTAL_REALIZED", True
-        ),
-        health_yellow_investment_multiplier=env_decimal("REINVEST_YELLOW_MULTIPLIER", "0.25"),
-        health_equity_high_watermark=env_decimal("REINVEST_EQUITY_HIGH_WATERMARK", "0"),
+        profit_reinvest_fraction=env_decimal("PROFIT_REINVEST_FRACTION", "0.50"),
         seed_positions_on_first_run=env_bool("SEED_POSITIONS_ON_FIRST_RUN", True),
         page_size=max(1, min(100, env_int("ACTIVITY_PAGE_SIZE", 100))),
         max_pages_per_cycle=max(1, env_int("MAX_ACTIVITY_PAGES_PER_CYCLE", 10)),
@@ -255,31 +232,8 @@ def load_config() -> Config:
         raise RuntimeError("RSI_BARS_LIMIT must be greater than RSI_PERIOD")
     if cfg.rsi_lookback_days <= 0:
         raise RuntimeError("RSI_LOOKBACK_DAYS must be greater than 0")
-    if cfg.health_yellow_exposure_pct <= 0 or cfg.health_red_exposure_pct <= 0:
-        raise RuntimeError("Reinvestment exposure thresholds must be greater than 0")
-    if cfg.health_red_exposure_pct < cfg.health_yellow_exposure_pct:
-        raise RuntimeError("REINVEST_RED_EXPOSURE_PCT must be >= REINVEST_YELLOW_EXPOSURE_PCT")
-    if not (Decimal("0") <= cfg.health_red_min_cash_pct <= cfg.health_yellow_min_cash_pct <= Decimal("1")):
-        raise RuntimeError(
-            "Cash thresholds must satisfy 0 <= RED_MIN_CASH <= YELLOW_MIN_CASH <= 1"
-        )
-    if not (Decimal("0") <= cfg.health_yellow_drawdown_pct <= cfg.health_red_drawdown_pct <= Decimal("1")):
-        raise RuntimeError(
-            "Drawdown thresholds must satisfy 0 <= YELLOW_DRAWDOWN <= RED_DRAWDOWN <= 1"
-        )
-    if not (
-        Decimal("0")
-        <= cfg.health_yellow_red_position_pct
-        <= cfg.health_red_red_position_pct
-        <= Decimal("1")
-    ):
-        raise RuntimeError(
-            "Red-position thresholds must satisfy 0 <= YELLOW_RED_POSITION <= RED_RED_POSITION <= 1"
-        )
-    if not (Decimal("0") < cfg.health_yellow_investment_multiplier <= Decimal("1")):
-        raise RuntimeError("REINVEST_YELLOW_MULTIPLIER must be > 0 and <= 1")
-    if cfg.health_equity_high_watermark < 0:
-        raise RuntimeError("REINVEST_EQUITY_HIGH_WATERMARK cannot be negative")
+    if not (Decimal("0") <= cfg.profit_reinvest_fraction <= Decimal("1")):
+        raise RuntimeError("PROFIT_REINVEST_FRACTION must be between 0 and 1")
     return cfg
 
 
@@ -319,11 +273,6 @@ def cents_down(value: Decimal) -> Decimal:
         return Decimal("0.00")
     return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-
-def safe_ratio(numerator: Decimal, denominator: Decimal) -> Decimal:
-    if denominator <= 0:
-        return Decimal("0")
-    return numerator / denominator
 
 
 def google_service_info(raw: str) -> Dict[str, Any]:
@@ -690,6 +639,8 @@ def ensure_initialized(
     state["last_activity_time"] = utc_now_iso()
     state.setdefault("total_realized_profit", "0.0000")
     state.setdefault("total_positive_profit", "0.0000")
+    state.setdefault("total_profit_allocated", "0.0000")
+    state.setdefault("total_profit_retained", "0.0000")
     state.setdefault("total_reinvested", "0.0000")
     state.setdefault("available_to_invest", "0.0000")
     state.setdefault("next_order_seq", "0")
@@ -697,6 +648,21 @@ def ensure_initialized(
         state.setdefault(pending_key(symbol), "0.0000")
 
     return {"seeded_lots": seeded, "skipped_seed_symbols": skipped}
+
+
+def remove_legacy_health_state(state: Dict[str, Any]) -> None:
+    """Remove stale health/recovery keys left by pre-0.4.0 deployments."""
+    for key in list(state):
+        if key.startswith("last_health_") or key == "equity_high_watermark":
+            state.pop(key, None)
+
+
+OPTION_SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,6}\d{6}[CP]\d{8}$")
+
+
+def contract_multiplier_for_symbol(symbol: str) -> Decimal:
+    """Return the OCC equity-option contract multiplier; equities remain 1."""
+    return Decimal("100") if OPTION_SYMBOL_RE.fullmatch(clean_symbol(symbol)) else Decimal("1")
 
 
 def fetch_fill_activities(session: requests.Session, cfg: Config, after: str) -> List[Dict[str, Any]]:
@@ -743,6 +709,7 @@ def realize_sell_fifo(
     symbol: str,
     qty: Decimal,
     sell_price: Decimal,
+    contract_multiplier: Decimal = Decimal("1"),
 ) -> Tuple[Decimal, Decimal]:
     remaining = qty
     matched = Decimal("0")
@@ -757,7 +724,7 @@ def realize_sell_fifo(
         if lot_qty <= 0 or lot_cost <= 0:
             continue
         take = min(remaining, lot_qty)
-        realized += take * (sell_price - lot_cost)
+        realized += take * (sell_price - lot_cost) * contract_multiplier
         matched += take
         remaining -= take
         lot["remaining_qty"] = decimal_text(lot_qty - take, "0.000000001")
@@ -770,14 +737,18 @@ def realize_sell_fifo(
     return realized, qty - matched
 
 
-def allocate_profit_to_targets(state: Dict[str, Any], targets: Sequence[str], profit: Decimal) -> Decimal:
-    if profit <= 0:
+def allocate_profit_to_targets(
+    state: Dict[str, Any],
+    targets: Sequence[str],
+    allocated_profit: Decimal,
+) -> Decimal:
+    if allocated_profit <= 0:
         return Decimal("0")
-    share = profit / Decimal(len(targets))
+    share = allocated_profit / Decimal(len(targets))
     for symbol in targets:
         current = to_decimal(state.get(pending_key(symbol)), Decimal("0")) or Decimal("0")
         set_pending(state, symbol, current + share)
-    return profit
+    return allocated_profit
 
 
 def process_activities(
@@ -796,14 +767,21 @@ def process_activities(
         "buy_lots_added": 0,
         "sell_fills": 0,
         "profitable_sells": 0,
-        "positive_profit_added": "0.0000",
+        "positive_profit_realized": "0.0000",
+        "profit_allocated": "0.0000",
+        "profit_retained": "0.0000",
+        "reinvest_fraction": decimal_text(cfg.profit_reinvest_fraction),
         "ignored_symbol_fills": 0,
         "unmatched_sell_fills": 0,
     }
 
     total_realized = to_decimal(state.get("total_realized_profit"), Decimal("0")) or Decimal("0")
     total_positive = to_decimal(state.get("total_positive_profit"), Decimal("0")) or Decimal("0")
-    positive_added = Decimal("0")
+    total_allocated = to_decimal(state.get("total_profit_allocated"), Decimal("0")) or Decimal("0")
+    total_retained = to_decimal(state.get("total_profit_retained"), Decimal("0")) or Decimal("0")
+    positive_realized = Decimal("0")
+    allocated_added = Decimal("0")
+    retained_added = Decimal("0")
 
     for activity in activities:
         summary["fills_seen"] += 1
@@ -819,6 +797,8 @@ def process_activities(
         note = ""
         realized = Decimal("0")
         pending_added = Decimal("0")
+        retained_cash = Decimal("0")
+        contract_multiplier = contract_multiplier_for_symbol(symbol)
 
         if activity_time > max_time:
             max_time = activity_time
@@ -834,7 +814,13 @@ def process_activities(
             note = "buy_lot_added"
         elif side == "sell":
             summary["sell_fills"] += 1
-            realized, unmatched_qty = realize_sell_fifo(lots, symbol, qty, price)
+            realized, unmatched_qty = realize_sell_fifo(
+                lots,
+                symbol,
+                qty,
+                price,
+                contract_multiplier=contract_multiplier,
+            )
             total_realized += realized
             if unmatched_qty > 0:
                 summary["unmatched_sell_fills"] += 1
@@ -843,9 +829,19 @@ def process_activities(
                 note = "sell_matched_fifo"
             if realized > 0:
                 summary["profitable_sells"] += 1
-                pending_added = allocate_profit_to_targets(state, cfg.invest_target_symbols, realized)
+                allocated_profit = realized * cfg.profit_reinvest_fraction
+                retained_cash = realized - allocated_profit
+                pending_added = allocate_profit_to_targets(
+                    state,
+                    cfg.invest_target_symbols,
+                    allocated_profit,
+                )
                 total_positive += realized
-                positive_added += realized
+                total_allocated += pending_added
+                total_retained += retained_cash
+                positive_realized += realized
+                allocated_added += pending_added
+                retained_added += retained_cash
 
         new_rows.append(
             {
@@ -860,6 +856,9 @@ def process_activities(
                 "pending_added": decimal_text(pending_added),
                 "note": note,
                 "processed_at": utc_now_iso(),
+                "reinvest_fraction": decimal_text(cfg.profit_reinvest_fraction),
+                "retained_cash": decimal_text(retained_cash),
+                "contract_multiplier": decimal_text(contract_multiplier, "0"),
             }
         )
         processed_ids.add(activity_id)
@@ -868,169 +867,14 @@ def process_activities(
     state["last_activity_time"] = max_time or utc_now_iso()
     state["total_realized_profit"] = decimal_text(total_realized)
     state["total_positive_profit"] = decimal_text(total_positive)
-    summary["positive_profit_added"] = decimal_text(positive_added)
+    state["total_profit_allocated"] = decimal_text(total_allocated)
+    state["total_profit_retained"] = decimal_text(total_retained)
+    summary["positive_profit_realized"] = decimal_text(positive_realized)
+    summary["profit_allocated"] = decimal_text(allocated_added)
+    summary["profit_retained"] = decimal_text(retained_added)
     activity_rows.extend(new_rows)
     return summary
 
-
-def activity_profit_factor(activity_rows: Sequence[Dict[str, str]]) -> Optional[Decimal]:
-    gross_profit = Decimal("0")
-    gross_loss = Decimal("0")
-    for row in activity_rows:
-        realized = to_decimal(row.get("realized_pl"), Decimal("0")) or Decimal("0")
-        if realized > 0:
-            gross_profit += realized
-        elif realized < 0:
-            gross_loss += abs(realized)
-    if gross_loss == 0:
-        return None if gross_profit == 0 else Decimal("999999")
-    return gross_profit / gross_loss
-
-
-def evaluate_reinvestment_health(
-    cfg: Config,
-    state: Dict[str, Any],
-    account: Dict[str, Any],
-    positions: Sequence[Dict[str, Any]],
-    activity_rows: Sequence[Dict[str, str]],
-) -> Dict[str, Any]:
-    equity = to_decimal(account.get("equity"), Decimal("0")) or Decimal("0")
-    cash = to_decimal(account.get("cash"), Decimal("0")) or Decimal("0")
-    long_market_value = to_decimal(account.get("long_market_value"), Decimal("0")) or Decimal("0")
-    buying_power = to_decimal(account.get("buying_power"), Decimal("0")) or Decimal("0")
-
-    valid_positions = [
-        position
-        for position in positions
-        if clean_symbol(position.get("symbol"))
-        and (to_decimal(position.get("qty"), Decimal("0")) or Decimal("0")) != 0
-    ]
-    position_count = len(valid_positions)
-    red_position_count = sum(
-        1
-        for position in valid_positions
-        if (to_decimal(position.get("unrealized_pl"), Decimal("0")) or Decimal("0")) < 0
-    )
-
-    exposure_pct = safe_ratio(max(long_market_value, Decimal("0")), equity)
-    cash_pct = safe_ratio(cash, equity)
-    red_position_pct = safe_ratio(Decimal(red_position_count), Decimal(position_count))
-
-    state_hwm = to_decimal(state.get("equity_high_watermark"), Decimal("0")) or Decimal("0")
-    high_watermark = max(cfg.health_equity_high_watermark, state_hwm, equity)
-    drawdown_pct = Decimal("0")
-    if high_watermark > 0 and equity > 0:
-        drawdown_pct = max(Decimal("0"), Decimal("1") - (equity / high_watermark))
-
-    total_realized = to_decimal(state.get("total_realized_profit"), Decimal("0")) or Decimal("0")
-    profit_factor = activity_profit_factor(activity_rows)
-
-    red_reasons: List[str] = []
-    yellow_reasons: List[str] = []
-
-    if equity <= 0:
-        red_reasons.append("equity_not_positive")
-    if position_count > cfg.health_max_position_count:
-        red_reasons.append(
-            f"position_count={position_count}>max={cfg.health_max_position_count}"
-        )
-    if exposure_pct >= cfg.health_red_exposure_pct:
-        red_reasons.append(
-            f"exposure={decimal_text(exposure_pct, '0.0001')}>=red={decimal_text(cfg.health_red_exposure_pct, '0.0001')}"
-        )
-    elif exposure_pct >= cfg.health_yellow_exposure_pct:
-        yellow_reasons.append(
-            f"exposure={decimal_text(exposure_pct, '0.0001')}>=yellow={decimal_text(cfg.health_yellow_exposure_pct, '0.0001')}"
-        )
-
-    if cash_pct <= cfg.health_red_min_cash_pct:
-        red_reasons.append(
-            f"cash_pct={decimal_text(cash_pct, '0.0001')}<=red_min={decimal_text(cfg.health_red_min_cash_pct, '0.0001')}"
-        )
-    elif cash_pct <= cfg.health_yellow_min_cash_pct:
-        yellow_reasons.append(
-            f"cash_pct={decimal_text(cash_pct, '0.0001')}<=yellow_min={decimal_text(cfg.health_yellow_min_cash_pct, '0.0001')}"
-        )
-
-    if drawdown_pct >= cfg.health_red_drawdown_pct:
-        red_reasons.append(
-            f"drawdown={decimal_text(drawdown_pct, '0.0001')}>=red={decimal_text(cfg.health_red_drawdown_pct, '0.0001')}"
-        )
-    elif drawdown_pct >= cfg.health_yellow_drawdown_pct:
-        yellow_reasons.append(
-            f"drawdown={decimal_text(drawdown_pct, '0.0001')}>=yellow={decimal_text(cfg.health_yellow_drawdown_pct, '0.0001')}"
-        )
-
-    if red_position_pct >= cfg.health_red_red_position_pct:
-        red_reasons.append(
-            f"red_position_pct={decimal_text(red_position_pct, '0.0001')}>=red={decimal_text(cfg.health_red_red_position_pct, '0.0001')}"
-        )
-    elif red_position_pct >= cfg.health_yellow_red_position_pct:
-        yellow_reasons.append(
-            f"red_position_pct={decimal_text(red_position_pct, '0.0001')}>=yellow={decimal_text(cfg.health_yellow_red_position_pct, '0.0001')}"
-        )
-
-    if cfg.health_require_positive_total_realized and total_realized <= 0:
-        red_reasons.append(
-            f"total_realized_profit={decimal_text(total_realized)}<=0"
-        )
-
-    if not cfg.health_gate_enabled:
-        mode = "GREEN"
-        multiplier = Decimal("1")
-        reasons = ["health_gate_disabled"]
-    elif red_reasons:
-        mode = "RED"
-        multiplier = Decimal("0")
-        reasons = red_reasons + yellow_reasons
-    elif yellow_reasons:
-        mode = "YELLOW"
-        multiplier = cfg.health_yellow_investment_multiplier
-        reasons = yellow_reasons
-    else:
-        mode = "GREEN"
-        multiplier = Decimal("1")
-        reasons = ["all_health_checks_passed"]
-
-    state["equity_high_watermark"] = decimal_text(high_watermark)
-    state["last_health_checked_at"] = utc_now_iso()
-    state["last_health_mode"] = mode
-    state["last_health_reasons"] = json.dumps(reasons, separators=(",", ":"))
-    state["last_health_multiplier"] = decimal_text(multiplier)
-    state["last_health_equity"] = decimal_text(equity)
-    state["last_health_cash"] = decimal_text(cash)
-    state["last_health_cash_pct"] = decimal_text(cash_pct)
-    state["last_health_exposure_pct"] = decimal_text(exposure_pct)
-    state["last_health_drawdown_pct"] = decimal_text(drawdown_pct)
-    state["last_health_position_count"] = str(position_count)
-    state["last_health_red_position_count"] = str(red_position_count)
-    state["last_health_red_position_pct"] = decimal_text(red_position_pct)
-    state["last_health_total_realized_profit"] = decimal_text(total_realized)
-    state["last_health_profit_factor"] = (
-        decimal_text(profit_factor) if profit_factor is not None else ""
-    )
-
-    return {
-        "enabled": cfg.health_gate_enabled,
-        "mode": mode,
-        "multiplier": decimal_text(multiplier),
-        "reasons": reasons,
-        "equity": decimal_text(equity),
-        "cash": decimal_text(cash),
-        "cash_pct": decimal_text(cash_pct),
-        "long_market_value": decimal_text(long_market_value),
-        "exposure_pct": decimal_text(exposure_pct),
-        "buying_power": decimal_text(buying_power),
-        "position_count": position_count,
-        "max_position_count": cfg.health_max_position_count,
-        "red_position_count": red_position_count,
-        "red_position_pct": decimal_text(red_position_pct),
-        "equity_high_watermark": decimal_text(high_watermark),
-        "drawdown_pct": decimal_text(drawdown_pct),
-        "total_realized_profit": decimal_text(total_realized),
-        "profit_factor": decimal_text(profit_factor) if profit_factor is not None else None,
-        "require_positive_total_realized": cfg.health_require_positive_total_realized,
-    }
 
 
 def safe_client_order_id(seq: int, symbol: str) -> str:
@@ -1108,38 +952,39 @@ def invest_pending(
     state: Dict[str, Any],
     order_rows: List[Dict[str, str]],
     worksheets: Dict[str, gspread.Worksheet],
-    health: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """Invest pending profit allocations when RSI and buying power permit.
+
+    Portfolio recovery/health modes were intentionally removed in 0.4.0.
+    Pending balances now contain only the configured share of positive profit.
+    """
     summary = {
         "orders_submitted": 0,
         "dry_run_orders": 0,
         "skipped_below_min": [],
         "skipped_rsi": [],
-        "skipped_health": [],
         "skipped_buying_power": [],
         "errors": [],
         "rsi": {},
-        "health": health,
     }
     buying_power: Optional[Decimal] = None
     if not cfg.dry_run:
-        buying_power = to_decimal(health.get("buying_power"), Decimal("0")) or Decimal("0")
+        buying_power = account_buying_power(session, cfg)
+
     total_reinvested = to_decimal(state.get("total_reinvested"), Decimal("0")) or Decimal("0")
     seq = int(to_decimal(state.get("next_order_seq"), Decimal("0")) or Decimal("0"))
     rsi_cache: Dict[str, Dict[str, Any]] = {}
     state_changed = False
-    health_mode = str(health.get("mode", "RED")).upper()
-    health_multiplier = to_decimal(health.get("multiplier"), Decimal("0")) or Decimal("0")
 
     for symbol in cfg.invest_target_symbols:
         pending = get_pending(state, symbol)
-        full_notional = cents_down(pending)
-        if full_notional < cfg.min_child_notional:
-            summary["skipped_below_min"].append({"symbol": symbol, "pending": decimal_text(pending)})
+        notional = cents_down(pending)
+        if notional < cfg.min_child_notional:
+            summary["skipped_below_min"].append(
+                {"symbol": symbol, "pending": decimal_text(pending)}
+            )
             continue
 
-        # Continue evaluating/logging RSI even while the health gate is RED so
-        # a portfolio-health pause cannot hide a market-data problem.
         if symbol not in rsi_cache:
             try:
                 rsi_cache[symbol] = rsi_signal_for_symbol(session, cfg, symbol)
@@ -1152,6 +997,7 @@ def invest_pending(
                     "rsi": None,
                     "reason": f"rsi_error: {exc}",
                 }
+
         signal = rsi_cache[symbol]
         summary["rsi"][symbol] = signal
         state[state_symbol_key("last_rsi", symbol)] = signal.get("rsi") or ""
@@ -1159,12 +1005,13 @@ def invest_pending(
         state[state_symbol_key("last_rsi_bars", symbol)] = str(signal.get("bars", ""))
         state[state_symbol_key("last_rsi_checked_at", symbol)] = utc_now_iso()
         state_changed = True
+
         if not signal.get("ready"):
             summary["skipped_rsi"].append(
                 {
                     "symbol": symbol,
                     "pending": decimal_text(pending),
-                    "notional": f"{full_notional:.2f}",
+                    "notional": f"{notional:.2f}",
                     "rsi": signal.get("rsi"),
                     "bars": signal.get("bars"),
                     "reason": signal.get("reason"),
@@ -1172,36 +1019,13 @@ def invest_pending(
             )
             continue
 
-        if health_mode == "RED" or health_multiplier <= 0:
-            summary["skipped_health"].append(
-                {
-                    "symbol": symbol,
-                    "pending": decimal_text(pending),
-                    "full_notional": f"{full_notional:.2f}",
-                    "mode": health_mode,
-                    "reasons": health.get("reasons", []),
-                }
-            )
-            continue
-
-        notional = cents_down(pending * health_multiplier)
-        if notional < cfg.min_child_notional:
-            summary["skipped_health"].append(
-                {
-                    "symbol": symbol,
-                    "pending": decimal_text(pending),
-                    "full_notional": f"{full_notional:.2f}",
-                    "adjusted_notional": f"{notional:.2f}",
-                    "mode": health_mode,
-                    "multiplier": decimal_text(health_multiplier),
-                    "reason": "health_adjusted_notional_below_min",
-                }
-            )
-            continue
-
         if buying_power is not None and buying_power < notional:
             summary["skipped_buying_power"].append(
-                {"symbol": symbol, "notional": f"{notional:.2f}", "buying_power": decimal_text(buying_power)}
+                {
+                    "symbol": symbol,
+                    "notional": f"{notional:.2f}",
+                    "buying_power": decimal_text(buying_power),
+                }
             )
             continue
 
@@ -1212,9 +1036,26 @@ def invest_pending(
             continue
 
         try:
-            order, note = try_submit_or_recover_existing(session, cfg, symbol, notional, client_order_id)
-            note = f"{note};health_mode={health_mode};health_multiplier={decimal_text(health_multiplier)}"
-            record_order_row(order_rows, order, symbol, notional, client_order_id, False, note)
+            order, note = try_submit_or_recover_existing(
+                session,
+                cfg,
+                symbol,
+                notional,
+                client_order_id,
+            )
+            note = (
+                f"{note};profit_reinvest_fraction="
+                f"{decimal_text(cfg.profit_reinvest_fraction)}"
+            )
+            record_order_row(
+                order_rows,
+                order,
+                symbol,
+                notional,
+                client_order_id,
+                False,
+                note,
+            )
             set_pending(state, symbol, pending - notional)
             state["next_order_seq"] = str(seq)
             total_reinvested += notional
@@ -1229,9 +1070,9 @@ def invest_pending(
             logger.exception("Could not submit reinvestment order for %s", symbol)
             summary["errors"].append({"symbol": symbol, "error": str(exc)})
 
-    state["available_to_invest"] = decimal_text(total_pending(state, cfg.invest_target_symbols))
-    state_changed = True
-
+    state["available_to_invest"] = decimal_text(
+        total_pending(state, cfg.invest_target_symbols)
+    )
     if state_changed:
         replace_sheet_rows(worksheets["state"], STATE_HEADERS, state_rows(state))
     return summary
@@ -1257,6 +1098,7 @@ def run_cycle(source: str = "manual") -> Dict[str, Any]:
         with requests.Session() as session:
             worksheets = open_store(cfg)
             state = state_from_rows(rows_from_sheet(worksheets["state"], STATE_HEADERS))
+            remove_legacy_health_state(state)
             lots = rows_from_sheet(worksheets["lots"], LOTS_HEADERS)
             activity_rows = rows_from_sheet(worksheets["activity"], ACTIVITY_HEADERS)
             order_rows = rows_from_sheet(worksheets["orders"], ORDER_HEADERS)
@@ -1265,16 +1107,6 @@ def run_cycle(source: str = "manual") -> Dict[str, Any]:
             after = str(state.get("last_activity_time", "") or utc_now_iso())
             activities = fetch_fill_activities(session, cfg, after)
             activity_summary = process_activities(cfg, state, lots, activity_rows, activities)
-
-            account = get_account(session, cfg)
-            positions = list_positions(session, cfg)
-            health_summary = evaluate_reinvestment_health(
-                cfg,
-                state,
-                account,
-                positions,
-                activity_rows,
-            )
 
             state["last_cycle_started_at"] = started
             state["last_cycle_finished_at"] = utc_now_iso()
@@ -1287,7 +1119,7 @@ def run_cycle(source: str = "manual") -> Dict[str, Any]:
             replace_sheet_rows(worksheets["activity"], ACTIVITY_HEADERS, activity_rows)
             replace_sheet_rows(worksheets["state"], STATE_HEADERS, state_rows(state))
 
-            invest_summary = invest_pending(session, cfg, state, order_rows, worksheets, health_summary)
+            invest_summary = invest_pending(session, cfg, state, order_rows, worksheets)
             summary.update(
                 {
                     "dry_run": cfg.dry_run,
@@ -1295,11 +1127,13 @@ def run_cycle(source: str = "manual") -> Dict[str, Any]:
                     "ignored_profit_symbols": sorted(cfg.ignored_profit_symbols),
                     "initialization": init_summary,
                     "activity": activity_summary,
-                    "health": health_summary,
+                    "profit_reinvest_fraction": decimal_text(cfg.profit_reinvest_fraction),
                     "investing": invest_summary,
                     "pending": {symbol: decimal_text(get_pending(state, symbol)) for symbol in cfg.invest_target_symbols},
                     "available_to_invest": decimal_text(total_pending(state, cfg.invest_target_symbols)),
                     "total_positive_profit": state.get("total_positive_profit", "0.0000"),
+                    "total_profit_allocated": state.get("total_profit_allocated", "0.0000"),
+                    "total_profit_retained": state.get("total_profit_retained", "0.0000"),
                     "total_reinvested": state.get("total_reinvested", "0.0000"),
                 }
             )
@@ -1316,18 +1150,21 @@ def run_cycle(source: str = "manual") -> Dict[str, Any]:
             activity = summary.get("activity", {})
             investing = summary.get("investing", {})
             logger.info(
-                "Profit reinvestor cycle finished source=%s fills_processed=%s available_to_invest=%s "
-                "health_mode=%s orders_submitted=%s dry_run_orders=%s skipped_below_min=%s "
-                "skipped_rsi=%s skipped_health=%s errors=%s",
+                "Profit reinvestor cycle finished source=%s fills_processed=%s "
+                "positive_profit_realized=%s profit_allocated=%s profit_retained=%s "
+                "available_to_invest=%s reinvest_fraction=%s orders_submitted=%s "
+                "dry_run_orders=%s skipped_below_min=%s skipped_rsi=%s errors=%s",
                 source,
                 activity.get("fills_processed"),
+                activity.get("positive_profit_realized"),
+                activity.get("profit_allocated"),
+                activity.get("profit_retained"),
                 summary.get("available_to_invest"),
-                summary.get("health", {}).get("mode"),
+                summary.get("profit_reinvest_fraction"),
                 investing.get("orders_submitted"),
                 investing.get("dry_run_orders"),
                 len(investing.get("skipped_below_min", [])),
                 len(investing.get("skipped_rsi", [])),
-                len(investing.get("skipped_health", [])),
                 len(investing.get("errors", [])),
             )
         else:
@@ -1381,7 +1218,16 @@ def startup_event() -> None:
         WORKER_THREAD = threading.Thread(target=worker_loop, name="profit-reinvestor-loop", daemon=True)
         WORKER_THREAD.start()
         LAST_STATUS.update({"state": "running", "version": APP_VERSION})
-        logger.info("Profit reinvestor background loop started poll_seconds=%s", cfg.poll_seconds)
+        logger.info(
+            "Profit reinvestor background loop started version=%s poll_seconds=%s "
+            "profit_reinvest_fraction=%s rsi_enabled=%s dry_run=%s targets=%s",
+            APP_VERSION,
+            cfg.poll_seconds,
+            decimal_text(cfg.profit_reinvest_fraction),
+            cfg.rsi_enabled,
+            cfg.dry_run,
+            cfg.invest_target_symbols,
+        )
     else:
         LAST_STATUS.update({"state": "idle", "version": APP_VERSION})
         logger.info("Profit reinvestor background loop disabled BOT_AUTO_START=false")
